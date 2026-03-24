@@ -12,6 +12,121 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// FilterOption 筛选选项结构体
+type FilterOption struct {
+	SortBy      string `json:"sort_by,omitempty"`
+	NoteType    string `json:"note_type,omitempty"`
+	PublishTime string `json:"publish_time,omitempty"`
+	SearchScope string `json:"search_scope,omitempty"`
+	Location    string `json:"location,omitempty"`
+}
+
+// internalFilterOption 内部使用的筛选选项(基于索引)
+type internalFilterOption struct {
+	FiltersIndex int
+	TagsIndex    int
+	Text         string
+}
+
+var filterOptionsMap = map[int][]internalFilterOption{
+	1: {
+		{FiltersIndex: 1, TagsIndex: 1, Text: "综合"},
+		{FiltersIndex: 1, TagsIndex: 2, Text: "最新"},
+		{FiltersIndex: 1, TagsIndex: 3, Text: "最多点赞"},
+		{FiltersIndex: 1, TagsIndex: 4, Text: "最多评论"},
+		{FiltersIndex: 1, TagsIndex: 5, Text: "最多收藏"},
+	},
+	2: {
+		{FiltersIndex: 2, TagsIndex: 1, Text: "不限"},
+		{FiltersIndex: 2, TagsIndex: 2, Text: "视频"},
+		{FiltersIndex: 2, TagsIndex: 3, Text: "图文"},
+	},
+	3: {
+		{FiltersIndex: 3, TagsIndex: 1, Text: "不限"},
+		{FiltersIndex: 3, TagsIndex: 2, Text: "一天内"},
+		{FiltersIndex: 3, TagsIndex: 3, Text: "一周内"},
+		{FiltersIndex: 3, TagsIndex: 4, Text: "半年内"},
+	},
+	4: {
+		{FiltersIndex: 4, TagsIndex: 1, Text: "不限"},
+		{FiltersIndex: 4, TagsIndex: 2, Text: "已看过"},
+		{FiltersIndex: 4, TagsIndex: 3, Text: "未看过"},
+		{FiltersIndex: 4, TagsIndex: 4, Text: "已关注"},
+	},
+	5: {
+		{FiltersIndex: 5, TagsIndex: 1, Text: "不限"},
+		{FiltersIndex: 5, TagsIndex: 2, Text: "同城"},
+		{FiltersIndex: 5, TagsIndex: 3, Text: "附近"},
+	},
+}
+
+func convertToInternalFilters(filter FilterOption) ([]internalFilterOption, error) {
+	var internalFilters []internalFilterOption
+	if filter.SortBy != "" {
+		internal, err := findInternalOption(1, filter.SortBy)
+		if err != nil {
+			return nil, fmt.Errorf("排序依据错误: %w", err)
+		}
+		internalFilters = append(internalFilters, internal)
+	}
+	if filter.NoteType != "" {
+		internal, err := findInternalOption(2, filter.NoteType)
+		if err != nil {
+			return nil, fmt.Errorf("笔记类型错误: %w", err)
+		}
+		internalFilters = append(internalFilters, internal)
+	}
+	if filter.PublishTime != "" {
+		internal, err := findInternalOption(3, filter.PublishTime)
+		if err != nil {
+			return nil, fmt.Errorf("发布时间错误: %w", err)
+		}
+		internalFilters = append(internalFilters, internal)
+	}
+	if filter.SearchScope != "" {
+		internal, err := findInternalOption(4, filter.SearchScope)
+		if err != nil {
+			return nil, fmt.Errorf("搜索范围错误: %w", err)
+		}
+		internalFilters = append(internalFilters, internal)
+	}
+	if filter.Location != "" {
+		internal, err := findInternalOption(5, filter.Location)
+		if err != nil {
+			return nil, fmt.Errorf("位置距离错误: %w", err)
+		}
+		internalFilters = append(internalFilters, internal)
+	}
+	return internalFilters, nil
+}
+
+func findInternalOption(filtersIndex int, text string) (internalFilterOption, error) {
+	options, exists := filterOptionsMap[filtersIndex]
+	if !exists {
+		return internalFilterOption{}, fmt.Errorf("筛选组 %d 不存在", filtersIndex)
+	}
+	for _, option := range options {
+		if option.Text == text {
+			return option, nil
+		}
+	}
+	return internalFilterOption{}, fmt.Errorf("在筛选组 %d 中未找到文本 '%s'", filtersIndex, text)
+}
+
+func validateInternalFilterOption(filter internalFilterOption) error {
+	if filter.FiltersIndex < 1 || filter.FiltersIndex > 5 {
+		return fmt.Errorf("无效的筛选组索引 %d，有效范围为 1-5", filter.FiltersIndex)
+	}
+	options, exists := filterOptionsMap[filter.FiltersIndex]
+	if !exists {
+		return fmt.Errorf("筛选组 %d 不存在", filter.FiltersIndex)
+	}
+	if filter.TagsIndex < 1 || filter.TagsIndex > len(options) {
+		return fmt.Errorf("筛选组 %d 的标签索引 %d 超出范围", filter.FiltersIndex, filter.TagsIndex)
+	}
+	return nil
+}
+
 type SearchAction struct {
 	page *rod.Page
 }
@@ -20,10 +135,10 @@ func NewSearchAction(page *rod.Page) *SearchAction {
 	return &SearchAction{page: page}
 }
 
-func safeNavigate(page *rod.Page, url string, timeout time.Duration) error {
+func safeNavigate(page *rod.Page, urlStr string, timeout time.Duration) error {
 	page = page.Timeout(timeout)
 	rod.Try(func() {
-		page.MustNavigate(url)
+		page.MustNavigate(urlStr)
 	})
 	return nil
 }
@@ -56,12 +171,14 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		}
 	}
 
-	logrus.Infof("[Search] Waiting for DOM content")
-	page.Timeout(15 * time.Second).WaitDOMContentLoaded()
+	// Wait for page load with explicit timeout (not WaitStable which can block forever)
+	logrus.Infof("[Search] Waiting for page load")
+	page.Timeout(15 * time.Second).WaitLoad()
 
+	// Wait for __INITIAL_STATE__ with 30s timeout (key fix - original had no timeout!)
 	stateFound := safeWait(page, `() => window.__INITIAL_STATE__ !== undefined && window.__INITIAL_STATE__.search !== undefined`, 30*time.Second)
 	if !stateFound {
-		logrus.Warnf("[Search] __INITIAL_STATE__ not found within 30s")
+		logrus.Warnf("[Search] __INITIAL_STATE__ not found within 30s, trying fallback")
 		return s.tryFallbackSearch(page, keyword)
 	}
 
@@ -127,8 +244,9 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 }
 
 func (s *SearchAction) tryFallbackSearch(page *rod.Page, keyword string) ([]Feed, error) {
+	// Try to extract from page source directly
 	rod.Try(func() {
-		page.Timeout(10 * time.Second).WaitDOMContentLoaded()
+		page.Timeout(10 * time.Second).WaitLoad()
 	})
 
 	result := ""
